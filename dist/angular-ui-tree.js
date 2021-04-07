@@ -19,7 +19,9 @@
       dragClass: 'angular-ui-tree-drag',
       dragThreshold: 3,
       defaultCollapsed: false,
-      appendChildOnHover: true
+      // This option is for creating subtrees. Since we are not using
+      // that feature, setting it to false by default.
+      appendChildOnHover: false
     });
 
 })();
@@ -628,8 +630,8 @@
 
   angular.module('ui.tree')
 
-    .directive('uiTreeNode', ['treeConfig', 'UiTreeHelper', '$window', '$document', '$timeout', '$q', '$interval',
-      function (treeConfig, UiTreeHelper, $window, $document, $timeout, $q, $interval) {
+    .directive('uiTreeNode', ['treeConfig', 'UiTreeHelper', '$window', '$document', '$timeout', '$q', '$interval', '$log',
+      function (treeConfig, UiTreeHelper, $window, $document, $timeout, $q, $interval, $log) {
         return {
           require: ['^uiTreeNodes', '^uiTree'],
           restrict: 'A',
@@ -675,7 +677,8 @@
               // This is the last valid drag move event
               lastValidDragMoveEventUponDragStart,
               // This is the drag check interval
-              DRAG_CHECK_INTERVAL = 10;
+              DRAG_CHECK_INTERVAL = 10,
+              lastPrintTime = 0;
 
             //Adding configured class to ui-tree-node.
             angular.extend(config, treeConfig);
@@ -725,6 +728,11 @@
               UiTreeHelper.setNodeAttribute(scope, 'scrollContainer', val);
               attrs.$set('scrollContainer', val);
               scrollContainerElm = document.querySelector(val);
+            });
+
+            attrs.$observe('treeNodeHeight', function(val) {
+              // This is the height of the tree node.
+              scope.treeNodeHeight = parseInt(val);
             });
 
             scope.$on('angular-ui-tree:collapse-all', function () {
@@ -977,6 +985,42 @@
 
             };
 
+            // This is a function that prints to the console. This prints a message
+            // at most once a second. This is useful within a function such as dragMove
+            // which is called many many times. A straight up log message causes the console
+            // to get bogged down printing those, so debugging becomes tricky. Using this
+            // function can help a little.
+            function printToLog(message){
+              if (Date.now() - lastPrintTime > 1000) {
+                $log.debug(message)
+                lastPrintTime = Date.now()
+              }
+            }
+
+            // This function determines the targetY to use for determining the
+            // target element. The library seems to have a bug where depending on where
+            // the user grabs the item (towards the top or towards the bottom), the target
+            // element choosing is affected. This should not be the case. So we will
+            // normalize the Y with respect to the element
+            function getTargetYToUse(targetX, targetY, eventObj) {
+                  // Normalize the Y with respect to the event anchored at the top
+                  // of the item
+              var targetYToUse = targetY - eventObj.offsetY,
+                  // Get the element at that position
+                  tempElm = angular.element($window.document.elementFromPoint(targetX, targetYToUse));
+
+              if (!tempElm.controller('uiTreeNode')) {
+                // If this is not a tree node, that means that we need to change the
+                // anchor to the bottom of the element
+                if (scope.treeNodeHeight) {
+                  // This should always be true
+                  targetYToUse += scope.treeNodeHeight;
+                }
+              }
+
+              return targetYToUse;
+            }
+
             dragMove = function (e) {
               var eventObj = UiTreeHelper.eventObj(e),
                 prev,
@@ -1168,13 +1212,16 @@
                   dragElm[0].style.display = 'none';
                 }
 
+                // Get the targetY to use
+                var targetYToUse = getTargetYToUse(targetX, targetY, eventObj);
+
                 //When using elementFromPoint() inside an iframe, you have to call
                 // elementFromPoint() twice to make sure IE8 returns the correct value
                 //MDN: The elementFromPoint() method of the Document interface returns the topmost element at the specified coordinates.
-                $window.document.elementFromPoint(targetX, targetY);
+                $window.document.elementFromPoint(targetX, targetYToUse);
 
                 //Set target element (element in specified x/y coordinates).
-                targetElm = angular.element($window.document.elementFromPoint(targetX, targetY));
+                targetElm = angular.element($window.document.elementFromPoint(targetX, targetYToUse));
 
                 //If the target element is a child element of a ui-tree-handle,
                 // use the containing handle element as target element
@@ -1346,7 +1393,16 @@
                     targetChildHeight = targetChildElm ? UiTreeHelper.height(targetChildElm) : 0;
                     targetHeight -= targetChildHeight;
                     targetBeforeBuffer = config.appendChildOnHover ? targetHeight * 0.25 : UiTreeHelper.height(targetElm) / 2;
-                    targetBefore = eventObj.pageY < (targetOffset.top + targetBeforeBuffer);
+
+                    if (pos.dirY) {
+                      // This means the mouse is moving down. The library has a bug that is does not
+                      // change the target element until a lot much more movement of the mouse
+                      // Fix it by adding the task height
+                      targetBefore = (eventObj.pageY - eventObj.offsetY + targetHeight) < (targetOffset.top + targetBeforeBuffer);
+                    } else {
+                      // This means the mosue is moving up
+                      targetBefore = (eventObj.pageY - eventObj.offsetY) < (targetOffset.top + targetBeforeBuffer);
+                    }
 
                     if (targetNode.$parentNodesScope.accept(scope, targetNode.index())) {
                       if (targetBefore) {
