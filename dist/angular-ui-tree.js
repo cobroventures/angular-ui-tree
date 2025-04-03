@@ -1002,6 +1002,9 @@
             // the user grabs the item (towards the top or towards the bottom), the target
             // element choosing is affected. This should not be the case. So we will
             // normalize the Y with respect to the element
+            // 04032025: After the update, It seems that the usage of this adjustment causes the targetYToUse to be incorrect
+            // so we will just skip this entirely
+            /*
             function getTargetYToUse(targetX, targetY, eventObj) {
                   // Normalize the Y with respect to the event anchored at the top
                   // of the item
@@ -1020,6 +1023,7 @@
 
               return targetYToUse;
             }
+              */
 
             dragMove = function (e) {
               var eventObj = UiTreeHelper.eventObj(e),
@@ -1212,16 +1216,13 @@
                   dragElm[0].style.display = 'none';
                 }
 
-                // Get the targetY to use
-                var targetYToUse = getTargetYToUse(targetX, targetY, eventObj);
-
                 //When using elementFromPoint() inside an iframe, you have to call
                 // elementFromPoint() twice to make sure IE8 returns the correct value
                 //MDN: The elementFromPoint() method of the Document interface returns the topmost element at the specified coordinates.
-                $window.document.elementFromPoint(targetX, targetYToUse);
+                $window.document.elementFromPoint(targetX, targetY);
 
                 //Set target element (element in specified x/y coordinates).
-                targetElm = angular.element($window.document.elementFromPoint(targetX, targetYToUse));
+                targetElm = angular.element($window.document.elementFromPoint(targetX, targetY));
 
                 //If the target element is a child element of a ui-tree-handle,
                 // use the containing handle element as target element
