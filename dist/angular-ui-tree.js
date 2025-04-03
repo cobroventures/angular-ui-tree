@@ -19,7 +19,9 @@
       dragClass: 'angular-ui-tree-drag',
       dragThreshold: 3,
       defaultCollapsed: false,
-      appendChildOnHover: true
+      // This option is for creating subtrees. Since we are not using
+      // that feature, setting it to false by default.
+      appendChildOnHover: false
     });
 
 })();
@@ -321,6 +323,7 @@
 
         $scope.dragEnabled = true;
         $scope.emptyPlaceholderEnabled = true;
+        $scope.dragElementExtraWidth = 0;
         $scope.maxDepth = 0;
         $scope.dragDelay = 0;
         $scope.cloneEnabled = false;
@@ -394,12 +397,12 @@
             if (element.prop('tagName').toLowerCase() === 'table') {
               scope.$emptyElm = angular.element($window.document.createElement('tr'));
               $trElm = element.find('tr');
-              
+
               //If we can find a tr, then we can use its td children as the empty element colspan.
               if ($trElm.length > 0) {
                 emptyElmColspan = angular.element($trElm).children().length;
               } else {
-                
+
                 //If not, by setting a huge colspan we make sure it takes full width.
                 //TODO(jcarter): Check for negative side effects.
                 emptyElmColspan = 1000000;
@@ -438,6 +441,16 @@
               if ((typeof val) == 'boolean') {
                 scope.emptyPlaceholderEnabled = val;
                 ctrl.resetEmptyElement();
+              }
+            });
+
+            // This value will typically not change, but if the drag drop wanted to keep
+            // adjusting the value as the drag element as the element position changes, we
+            // will adjust the drag element accordingly.
+            scope.$watch(attrs.dragElementExtraWidth, function (val) {
+              if ((typeof val) == 'number') {
+                // This is the extra width that is added to the drag element if so desired.
+                scope.dragElementExtraWidth = val;
               }
             });
 
@@ -617,8 +630,8 @@
 
   angular.module('ui.tree')
 
-    .directive('uiTreeNode', ['treeConfig', 'UiTreeHelper', '$window', '$document', '$timeout', '$q',
-      function (treeConfig, UiTreeHelper, $window, $document, $timeout, $q) {
+    .directive('uiTreeNode', ['treeConfig', 'UiTreeHelper', '$window', '$document', '$timeout', '$q', '$interval', '$log',
+      function (treeConfig, UiTreeHelper, $window, $document, $timeout, $q, $interval, $log) {
         return {
           require: ['^uiTreeNodes', '^uiTree'],
           restrict: 'A',
@@ -655,11 +668,17 @@
               bindDragStartEvents,
               bindDragMoveEvents,
               unbindDragMoveEvents,
-              keydownHandler,
+              keyupHandler,
               isHandleChild,
               el,
               isUiTreeRoot,
-              treeOfOrigin;
+              treeOfOrigin,
+              uiTreeNodesContainer,
+              // This is the last valid drag move event
+              lastValidDragMoveEventUponDragStart,
+              // This is the drag check interval
+              DRAG_CHECK_INTERVAL = 10,
+              lastPrintTime = 0;
 
             //Adding configured class to ui-tree-node.
             angular.extend(config, treeConfig);
@@ -711,6 +730,11 @@
               scrollContainerElm = document.querySelector(val);
             });
 
+            attrs.$observe('treeNodeHeight', function(val) {
+              // This is the height of the tree node.
+              scope.treeNodeHeight = parseInt(val);
+            });
+
             scope.$on('angular-ui-tree:collapse-all', function () {
               scope.collapsed = true;
             });
@@ -718,6 +742,42 @@
             scope.$on('angular-ui-tree:expand-all', function () {
               scope.collapsed = false;
             });
+
+            // This function clears out all the vars related to
+            // auto scroll improvements. See the startDragIntervalEventFire
+            // for details
+            function clearDragIntervalEventFire() {
+              if (dragTimer) {
+                // cancel the timer
+                $interval.cancel(dragTimer);
+                dragTimer = null;
+              }
+              // Clear the last recorded move event.
+              lastValidDragMoveEventUponDragStart = null;
+            }
+
+            // In this library, auto scroll is invoked based on drag
+            // move. So if the user were to drag an item, and then drag
+            // above the first task (or below the bottom most task),
+            // and then holds the mouse steady, the auto
+            // scroll would stop since there is no drag move events (since
+            // the user is holding the the mouse more or less steady).
+            // So what we will do is emulate a move event every N DRAG_CHECK_INTERVAL
+            // ms while the drag is active so that the auto scroll keeps happening.
+            // This function is called upon drag start
+            function startDragIntervalEventFire() {
+              // Clear any previous state (this is for safety only)
+              clearDragIntervalEventFire();
+
+              // Run the below function every DRAG_CHECK_INTERVAL milliseconds
+              dragTimer = $interval(function(){
+                if (lastValidDragMoveEventUponDragStart) {
+                  // If there is a valid event, use that for the
+                  // fire event
+                  dragMove(lastValidDragMoveEventUponDragStart);
+                }
+              }, DRAG_CHECK_INTERVAL, 0, false);
+            }
 
             /**
              * Called when the user has grabbed a node and started dragging it.
@@ -736,6 +796,10 @@
               if (e.uiTreeDragging || (e.originalEvent && e.originalEvent.uiTreeDragging)) {
                 return;
               }
+
+              // Below function is being called on drag start.
+              // See function for details.
+              startDragIntervalEventFire();
 
               //The node being dragged.
               var eventElm = angular.element(e.target),
@@ -853,7 +917,12 @@
               //Creating drag element to represent node.
               dragElm = angular.element($window.document.createElement(scope.$parentNodesScope.$element.prop('tagName')))
                   .addClass(scope.$parentNodesScope.$element.attr('class')).addClass(config.dragClass);
-              dragElm.css('width', UiTreeHelper.width(element) + 'px');
+
+              // Calculate the actual width of the element based on the drag element
+              // extra width and the base width of the element before it the drag
+              // started.
+              var dragElmWidth = UiTreeHelper.width(element) + scope.dragElementExtraWidth;
+              dragElm.css('width', dragElmWidth + 'px');
               dragElm.css('z-index', 9999);
 
               //Prevents cursor to change rapidly in Opera 12.16 and IE when dragging an element.
@@ -901,7 +970,56 @@
               //Get bounds of document.
               document_height = Math.max(body.scrollHeight, body.offsetHeight, html.clientHeight, html.scrollHeight, html.offsetHeight);
               document_width = Math.max(body.scrollWidth, body.offsetWidth, html.clientWidth, html.scrollWidth, html.offsetWidth);
+
+              if (scrollContainerElm) {
+                // If the scroll container is present, this will help us compute the
+                // bounds of the scroll area so that we can allow drop from any part
+                // of the screen. For instance, if the user were to drag the drag element
+                // way to the right (does not intersect with any entry) and then moves the
+                // the element up or down, it would be as if the user moved the drag
+                // element up and down without moving to the right.
+                // If the scroll container is not provided, the code will still work,
+                // except that the user has to drag within the bounds of the scroll area.
+                uiTreeNodesContainer = document.querySelectorAll('[ui-tree-nodes]');
+              }
+
             };
+
+            // This is a function that prints to the console. This prints a message
+            // at most once a second. This is useful within a function such as dragMove
+            // which is called many many times. A straight up log message causes the console
+            // to get bogged down printing those, so debugging becomes tricky. Using this
+            // function can help a little.
+            function printToLog(message){
+              if (Date.now() - lastPrintTime > 1000) {
+                $log.debug(message)
+                lastPrintTime = Date.now()
+              }
+            }
+
+            // This function determines the targetY to use for determining the
+            // target element. The library seems to have a bug where depending on where
+            // the user grabs the item (towards the top or towards the bottom), the target
+            // element choosing is affected. This should not be the case. So we will
+            // normalize the Y with respect to the element
+            function getTargetYToUse(targetX, targetY, eventObj) {
+                  // Normalize the Y with respect to the event anchored at the top
+                  // of the item
+              var targetYToUse = targetY - eventObj.offsetY,
+                  // Get the element at that position
+                  tempElm = angular.element($window.document.elementFromPoint(targetX, targetYToUse));
+
+              if (!tempElm.controller('uiTreeNode')) {
+                // If this is not a tree node, that means that we need to change the
+                // anchor to the bottom of the element
+                if (scope.treeNodeHeight) {
+                  // This should always be true
+                  targetYToUse += scope.treeNodeHeight;
+                }
+              }
+
+              return targetYToUse;
+            }
 
             dragMove = function (e) {
               var eventObj = UiTreeHelper.eventObj(e),
@@ -928,7 +1046,17 @@
                 targetHeight,
                 targetChildElm,
                 targetChildHeight,
-                isDropzone;
+                isDropzone,
+                maxRightX = -1,
+                minLeftX = -1,
+                maxBottomY = -1,
+                minTopY = -1;
+
+             // Record the last mouse move event. This will help us
+             // fire the move event for auto scroll with respect to
+             // the last known mouse position so that the auto
+             // scroll keeps working smoothing
+             lastValidDragMoveEventUponDragStart = e;
 
               //If check ensures that drag element was created.
               if (dragElm) {
@@ -970,6 +1098,24 @@
                   'left': leftElmPos + 'px',
                   'top': topElmPos + 'px'
                 });
+
+                if (scrollContainerElm) {
+                  // If the scroll container element was set, we can allow the user to
+                  // drag an element outside of the scroll container and still drop the
+                  // element. We will compute the drop target based on the position of the
+                  // drag element. For instance, if the user were to drag the drag element
+                  // way to the right (does not intersect with any entry) and then moves the
+                  // the element up or down, it would be as if the user moved the drag
+                  // element up and down without moving to the right.
+                  var treeNodesBoundClientRect = uiTreeNodesContainer[0].getBoundingClientRect();
+                  minTopY = treeNodesBoundClientRect.top + 10;
+                  // There is one more item underneath, so that has to be accounted for
+                  // Perhaps this has to be parameterized and passed in to the directive
+                  maxBottomY = treeNodesBoundClientRect.bottom - element[0].offsetHeight - 10;
+
+                  maxRightX = treeNodesBoundClientRect.right - 10;
+                  minLeftX = treeNodesBoundClientRect.left + 10;
+                }
 
                 if (scrollContainerElm) {
                   //Getting position to top and bottom of container element.
@@ -1024,6 +1170,38 @@
                     $window.document.documentElement.scrollTop) -
                     ($window.document.documentElement.clientTop || 0);
 
+                // Say there is a vertical list of elements (e1, e2, e3) in that order
+                // The user starts dragging e3 towards the top. However if the user
+                // were to move the elemnent way to the right (or left) so that there is
+                // no overlap between the dragged element and the elements above, we want
+                // to still honor the drop. This is not being supported in the current code.
+                // Similarly, if the user were to drag outside the bounds below (or above), we
+                // want to allow the drop to be to the last (or first).
+                // In order to do this, we will adjust the targetX and/or targetY so that the
+                // code ahead works without any changes.
+                // NOTE: In order for the code below to take effect, the scroll container element
+                // has to be set by the client so that the bounds (maxRightX, minLeftX, maxBottomY, minTopY)
+                // are computed.
+                if ((targetX > maxRightX) && maxRightX > 0) {
+                  // Case A1: The drag element is to the right of all elements, so
+                  // set the targetX to be max right value
+                  targetX = maxRightX;
+                } else if ((targetX < minLeftX) && minLeftX >= 0){
+                  // Case A2: The drag element is to the left of all elements, so
+                  // set the targetX to be min left value
+                  targetX = minLeftX;
+                }
+
+                if ((targetY > maxBottomY) && maxBottomY > 0) {
+                  // Case B1: The drag element is below all elements, so
+                  // set the targetY to be max bottom value
+                  targetY = maxBottomY;
+                } else if ((targetY < minTopY) && minTopY >= 0){
+                  // Case B2: The drag element is above all elements, so
+                  // set the targetY to be min top value
+                  targetY = minTopY;
+                }
+
                 //Select the drag target. Because IE does not support CSS 'pointer-events: none', it will always
                 // pick the drag element itself as the target. To prevent this, we hide the drag element while
                 // selecting the target.
@@ -1034,13 +1212,16 @@
                   dragElm[0].style.display = 'none';
                 }
 
+                // Get the targetY to use
+                var targetYToUse = getTargetYToUse(targetX, targetY, eventObj);
+
                 //When using elementFromPoint() inside an iframe, you have to call
                 // elementFromPoint() twice to make sure IE8 returns the correct value
                 //MDN: The elementFromPoint() method of the Document interface returns the topmost element at the specified coordinates.
-                $window.document.elementFromPoint(targetX, targetY);
+                $window.document.elementFromPoint(targetX, targetYToUse);
 
                 //Set target element (element in specified x/y coordinates).
-                targetElm = angular.element($window.document.elementFromPoint(targetX, targetY));
+                targetElm = angular.element($window.document.elementFromPoint(targetX, targetYToUse));
 
                 //If the target element is a child element of a ui-tree-handle,
                 // use the containing handle element as target element
@@ -1212,7 +1393,16 @@
                     targetChildHeight = targetChildElm ? UiTreeHelper.height(targetChildElm) : 0;
                     targetHeight -= targetChildHeight;
                     targetBeforeBuffer = config.appendChildOnHover ? targetHeight * 0.25 : UiTreeHelper.height(targetElm) / 2;
-                    targetBefore = eventObj.pageY < (targetOffset.top + targetBeforeBuffer);
+
+                    if (pos.dirY) {
+                      // This means the mouse is moving down. The library has a bug that is does not
+                      // change the target element until a lot much more movement of the mouse
+                      // Fix it by adding the task height
+                      targetBefore = (eventObj.pageY - eventObj.offsetY + targetHeight) < (targetOffset.top + targetBeforeBuffer);
+                    } else {
+                      // This means the mosue is moving up
+                      targetBefore = (eventObj.pageY - eventObj.offsetY) < (targetOffset.top + targetBeforeBuffer);
+                    }
 
                     if (targetNode.$parentNodesScope.accept(scope, targetNode.index())) {
                       if (targetBefore) {
@@ -1239,7 +1429,7 @@
                 }
 
                 //Triggering dragMove callback.
-                scope.$apply(function () {
+                scope.$evalAsync(function () {
                   scope.$treeScope.$callbacks.dragMove(dragInfo.eventArgs(elements, pos));
                 });
               }
@@ -1250,6 +1440,9 @@
               var dragEventArgs = dragInfo.eventArgs(elements, pos);
 
               e.preventDefault();
+
+              // Clear drag interval upon drag end
+              clearDragIntervalEventFire();
 
               //TODO(jcarter): Is dragStart need to be unbound?
               unbindDragMoveEvents();
@@ -1341,9 +1534,13 @@
               };
             })();
 
-            keydownHandler = function (e) {
+            keyupHandler = function (e) {
               if (e.keyCode === 27) {
-                dragEndEvent(e);
+                // When the user clicks escape, the original code would consider it a
+                // drop. However, we want to escape to act as an abort of the drag drop
+                // so set the $$allowNodeDrop to false and end the drag.
+                scope.$$allowNodeDrop = false;
+                dragEnd(e);
               }
             };
 
@@ -1380,7 +1577,10 @@
               angular.element($document).bind('mouseup', dragEndEvent);
               angular.element($document).bind('mousemove', dragMoveEvent);
               angular.element($document).bind('mouseleave', dragCancelEvent);
-              angular.element($document).bind('keydown', keydownHandler);
+              // We have to use the keyup handler since the key down is used
+              // to detect the blur in the client code. This is not ideal but
+              // it works either ways, so we have made the change here.
+              angular.element($document).bind('keyup', keyupHandler);
             };
 
             /**
@@ -1393,7 +1593,10 @@
               angular.element($document).unbind('mouseup', dragEndEvent);
               angular.element($document).unbind('mousemove', dragMoveEvent);
               angular.element($document).unbind('mouseleave', dragCancelEvent);
-              angular.element($document).unbind('keydown', keydownHandler);
+              // We have to use the keyup handler since the key down is used
+              // to detect the blur in the client code. This is not ideal but
+              // it works either ways, so we have made the change here.
+              angular.element($document).unbind('keyup', keyupHandler);
             };
           }
         };
@@ -1523,7 +1726,7 @@
 
           /**
            * Get the event object for touches.
-           * 
+           *
            * @param  {MouseEvent|TouchEvent} e MouseEvent or TouchEvent that kicked off dragX method.
            * @return {MouseEvent|TouchEvent} Object returned as original event object.
            */
@@ -1541,7 +1744,7 @@
 
           /**
            * Generate object used to store data about node being moved.
-           * 
+           *
            * {angular.$scope} node Scope of the node that is being moved.
            */
           dragInfo: function (node) {
@@ -1771,19 +1974,19 @@
             pos.nowX = pageX;
             pos.nowY = pageY;
 
-            //Distance mouse moved between events.          
+            //Distance mouse moved between events.
             pos.distX = pos.nowX - pos.lastX;
             pos.distY = pos.nowY - pos.lastY;
 
-            //Direction mouse was moving.           
+            //Direction mouse was moving.
             pos.lastDirX = pos.dirX;
             pos.lastDirY = pos.dirY;
 
-            //Direction mouse is now moving (on both axis).          
+            //Direction mouse is now moving (on both axis).
             pos.dirX = pos.distX === 0 ? 0 : pos.distX > 0 ? 1 : -1;
             pos.dirY = pos.distY === 0 ? 0 : pos.distY > 0 ? 1 : -1;
 
-            //Axis mouse is now moving on.         
+            //Axis mouse is now moving on.
             newAx = Math.abs(pos.distX) > Math.abs(pos.distY) ? 1 : 0;
 
             //Do nothing on first move.
@@ -1793,7 +1996,7 @@
               return;
             }
 
-            //Calc distance moved on this axis (and direction).          
+            //Calc distance moved on this axis (and direction).
             if (pos.dirAx !== newAx) {
               pos.distAxX = 0;
               pos.distAxY = 0;
